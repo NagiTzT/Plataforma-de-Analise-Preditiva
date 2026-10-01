@@ -823,11 +823,8 @@ def _league_name(event: dict[str, Any]) -> str:
 
 
 def _country_name(event: dict[str, Any]) -> str:
-    league = _league(event)
-    country = _first_dict(league, ("country", "category")) or _first_dict(
-        event, ("country", "category")
-    )
-    return str(country.get("name") or country.get("title") or "").strip()
+    from phase4_metadata import competition_metadata
+    return competition_metadata(event, league=_league_name(event))["country"] or ""
 
 
 def _season_label(event: dict[str, Any]) -> str:
@@ -1307,13 +1304,17 @@ def collect_soccer_radar_games(
         # Phase 4 freezes every valid-market candidate before the production
         # odds rule. This is research-only and cannot add a game to the radar.
         from phase4_research import capture_eligibility_candidate
+        from phase4_metadata import competition_metadata
+        country_metadata = competition_metadata(
+            event, allsports_event, market, league=_league_name(event))
         phase4_capture = capture_eligibility_candidate(
             db_path, research_run_id, allsports_id,
             [odd_home, odd_draw, odd_away], event_start_timestamp(event),
             market_seen_at, provider='allsports', home_team=home_name,
-            away_team=away_name, league=_league_name(event), country=_country_name(event),
+            away_team=away_name, league=_league_name(event), country=country_metadata["country"],
             season=_season_label(event), source_event_id=source_id,
             suspended=bool(market.get('suspended')),
+            metadata_provenance=country_metadata,
         )
         eligibility = phase4_capture["group"]
         counters["phase4_capture_failures"] += int(not phase4_capture["saved"])

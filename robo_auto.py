@@ -1503,7 +1503,8 @@ def _cached_api_response(url):
             _api_response_cache.pop(url, None)
     return None
 
-def safe_api_get(url, max_retries=3, timeout=(3.05, 20), return_bytes=False):
+def safe_api_get(url, max_retries=3, timeout=(3.05, 20), return_bytes=False,
+                 max_http_requests=None):
     """GET com cache TTL, deduplicação entre workers, rate limit e retries."""
     global _last_request_time
     with _api_cache_lock:
@@ -1517,7 +1518,10 @@ def safe_api_get(url, max_retries=3, timeout=(3.05, 20), return_bytes=False):
         if cached is not None:
             return cached
         failures = 0
+        http_attempts = 0
         while failures < max_retries:
+            if max_http_requests is not None and http_attempts >= max(0, int(max_http_requests)):
+                return None
             api_key, key_id, key_idx = _reserve_rapidapi_key()
             if not api_key:
                 _notify_no_rapidapi_keys(url)
@@ -1530,6 +1534,7 @@ def safe_api_get(url, max_retries=3, timeout=(3.05, 20), return_bytes=False):
                         time.sleep(RAPIDAPI_MIN_INTERVAL_SECONDS - elapsed)
                     _last_request_time = time.time()
                 try:
+                    http_attempts += 1
                     with _api_cache_lock:
                         _api_metrics["http_requests"] += 1
                     request_headers = dict(HEADERS); request_headers["x-rapidapi-key"] = api_key

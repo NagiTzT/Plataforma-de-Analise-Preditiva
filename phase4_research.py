@@ -103,7 +103,7 @@ def market_metrics(odds, observed_at, kickoff, suspended=False):
 def capture_eligibility_candidate(
     db_path, run_id, match_id, odds, kickoff, observed_at, *, provider,
     home_team, away_team, league, country=None, season=None, source_event_id=None,
-    suspended=False,
+    suspended=False, metadata_provenance=None,
 ):
     """Freeze a valid-market candidate before applying the production rule."""
     metrics = market_metrics(odds, observed_at, kickoff, suspended)
@@ -131,6 +131,7 @@ def capture_eligibility_candidate(
         "away_team": away_team,
         "league": league,
         "country": country,
+        "metadata_provenance": metadata_provenance,
         "season": season,
         "source_event_id": source_event_id,
         "home_odd": float(odds[0]),

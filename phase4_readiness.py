@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from phase4_research import challenger_definitions, champion_identity, preregistration_document
+from phase4_metadata import country_from_league
 
 
 def proportion_n(p, delta, alpha_z=1.9599639845, power_z=0.8416212336):
@@ -41,13 +42,16 @@ def load_sidecar(path):
     for r in rows:
         try:
             r["data"] = json.loads(r["payload"])
+            if r["stage"] == "phase4_outcome_v1":
+                # Readiness needs association counts, never the label/class.
+                r["data"] = {"eligibility_group": r["data"].get("eligibility_group")}
         except json.JSONDecodeError:
             r["data"] = None
             valid = False
     return rows, {"status": "HEALTHY" if valid and triggers == 2 else "INVALID",
                   "exists": True, "integrity_ok": valid, "immutable_triggers": triggers,
                   "records": len(rows), "runs": len({r["run_id"] for r in rows
-                                                        if r["run_id"] != "phase4-registry"})}
+                                                        if r["stage"] == "collection_started"})}
 
 
 def summarize(db_path, sidecar_path):
@@ -68,6 +72,19 @@ def summarize(db_path, sidecar_path):
     analysis_rows = [r for r in rows
                      if r["run_id"] == "phase4-registry" or r["run_id"] in valid_runs]
     prefilter_rows = [r for r in analysis_rows if r["stage"] == "phase4_prefilter_v1" and r["data"]]
+    parent_by_key = {(r['run_id'],r['match_id']):r for r in prefilter_rows}
+    metadata_repairs = 0
+    for repair in analysis_rows:
+        if repair['stage'] != 'phase4_metadata_repair_v1' or not repair['data']:
+            continue
+        parent = parent_by_key.get((repair['run_id'],repair['match_id']))
+        data = repair['data']
+        if (parent and not parent['data'].get('country')
+                and data.get('parent_sha256') == parent['sha256']
+                and data.get('static_metadata_only') is True
+                and data.get('country') == country_from_league(parent['data'].get('league'))):
+            parent['data'] = {**parent['data'],'country':data['country']}
+            metadata_repairs += 1
     prefilter = [r["data"] for r in prefilter_rows]
     market_bundle_rows = [r for r in analysis_rows if r["stage"] == "market_bundle_v1" and r["data"]]
     market_bundles = [r["data"] for r in market_bundle_rows]
@@ -116,6 +133,7 @@ def summarize(db_path, sidecar_path):
         for family in bundle.get("available_market_families") or []:
             aux[family] += 1
     coverage = collections.Counter()
+    original_coverage = collections.Counter()
     coverage_by_group = collections.defaultdict(collections.Counter)
     group_by_key = {(r["run_id"], r["match_id"]): r["data"]["eligibility_group"]
                     for r in prefilter_rows}
@@ -124,10 +142,70 @@ def summarize(db_path, sidecar_path):
         families = ((prediction.get("data_coverage") or {}).get("families") or {})
         for family, available in families.items():
             if available is True:
-                coverage[family] += 1
+                original_coverage[family] += 1
+    family_by_key = {}
+    free_shots_recovered = 0
+    for row in prefilter_prediction_rows:
+        key = (row['run_id'],row['match_id'])
+        families = dict((row['data'].get('data_coverage') or {}).get('families') or {})
+        f = row['data'].get('features') or {}
+        # These counts were already frozen before kickoff; zeros of a measured
+        # statistic are valid, but absence/NaN is not a measured observation.
+        try:
+            free_samples = [float(f.get(f'free_{side}_all_target_{direction}_games') or 0)
+                            for side in ('home','away') for direction in ('for','against')]
+            free_shots = all(math.isfinite(n) and n>=3 for n in free_samples)
+        except (TypeError,ValueError):
+            free_shots = False
+        if free_shots and not families.get('shots_on_target'):
+            families['shots_on_target'] = True
+            free_shots_recovered += 1
+        family_by_key[key] = families
+    # Never let separately acquired covariates retroactively unlock the
+    # preregistered study of frozen champion inputs.
+    frozen_input_coverage = collections.Counter()
+    for families in family_by_key.values():
+        frozen_input_coverage.update(k for k,v in families.items() if v is True)
+    covariates_valid = 0
+    covariates_rejected = 0
+    covariate_versions = collections.Counter()
+    for row in analysis_rows:
+        if row['stage'] != 'phase4_covariates_v2' or not row['data']:
+            continue
+        key = (row['run_id'],row['match_id']);parent=parent_by_key.get(key);data=row['data']
+        captured=data.get('captured_at');kickoff=parent['data'].get('event_time') if parent else None
+        valid = bool(parent and data.get('parent_sha256')==parent['sha256']
+            and isinstance(captured,(int,float)) and isinstance(kickoff,(int,float))
+            and parent['observed_at']<=captured<kickoff and row['observed_at']<kickoff
+            and data.get('separate_from_champion_inputs') is True)
+        evidence=data.get('evidence') or {};f=data.get('features') or {}
+        families=(data.get('data_coverage') or {}).get('families') or {}
+        if valid:
+            try:
+                for metric in ('xg','shots_on_target','big_chances'):
+                    if families.get(metric) is not True:continue
+                    for side in ('home','away'):
+                        samples=evidence.get(f'{side}_{metric}') or []
+                        ids={str(sample.get('match_id') or '') for sample in samples}
+                        n=float(f.get(f'research_{side}_{metric}_games') or 0)
+                        if (len(ids)<3 or '' in ids or row['match_id'] in ids
+                                or not math.isfinite(n) or n<3
+                                or any(not isinstance(sample.get('event_time'),(int,float))
+                                       or sample['event_time']+3*3600>=captured for sample in samples)):
+                            valid=False
+            except (TypeError,ValueError,AttributeError):
+                valid=False
+        if not valid:
+            covariates_rejected+=1;continue
+        covariates_valid+=1;covariate_versions[str(data.get('version'))]+=1
+        union=family_by_key.setdefault(key,{})
+        for metric,available in families.items():
+            if available is True:union[metric]=True
+    for families in family_by_key.values():
+        coverage.update(k for k,v in families.items() if v is True)
     for row in prefilter_prediction_rows:
         group = group_by_key.get((row["run_id"], row["match_id"]), "UNKNOWN")
-        families = ((row["data"].get("data_coverage") or {}).get("families") or {})
+        families = family_by_key.get((row['run_id'],row['match_id']), {})
         for family, available in families.items():
             coverage_by_group[group][family + ("_observed" if available is True else "_missing")] += 1
     bundle_by_key = {(r["run_id"], r["match_id"]): r["data"] for r in market_bundle_rows}
@@ -145,7 +223,7 @@ def summarize(db_path, sidecar_path):
         if bundle.get("available_market_families"):
             league_detail[league]["aux_market_available"] += 1
         prediction = prediction_by_key.get((row["run_id"], row["match_id"]), {})
-        families = ((prediction.get("data_coverage") or {}).get("families") or {})
+        families = family_by_key.get((row['run_id'],row['match_id']), {})
         league_detail[league]["xg_available"] += int(families.get("xg") is True)
         league_detail[league]["shots_on_target_available"] += int(families.get("shots_on_target") is True)
         league_detail[league]["big_chances_available"] += int(families.get("big_chances") is True)
@@ -180,7 +258,7 @@ def summarize(db_path, sidecar_path):
     radars = len(collection_runs)
     target_families = ("team_form", "elo_rating", "home_away", "league_profile",
                        "xg", "shots_on_target", "big_chances")
-    family_min = min((coverage.get(name, 0) for name in target_families), default=0)
+    family_min = min((frozen_input_coverage.get(name, 0) for name in target_families), default=0)
     leagues_with_both = sum(
         counts.get("A_ELIGIBLE", 0) >= 20
         and sum(v for k, v in counts.items() if k.startswith("B")) >= 20
@@ -188,7 +266,7 @@ def summarize(db_path, sidecar_path):
     )
     def represented_values(dimension, group_name, minimum=1):
         return sum(counts.get(group_name, 0) >= minimum
-                   for counts in strata_by_group[dimension].values())
+                   for value,counts in strata_by_group[dimension].items() if value!='UNKNOWN')
 
     largest_league_share = {}
     for group_name, denominator in (("eligible", eligible), ("non_eligible", noneligible)):
@@ -261,7 +339,8 @@ def summarize(db_path, sidecar_path):
         "resolved_non_eligible": {"current": resolved_noneligible, "target": trigger["minimum_resolved_non_eligible"],
                                   "reason": "count only; outcome values remain blinded"},
         "family_observations": {"current_min": family_min,
-                                "target": trigger["minimum_family_observations"]},
+                                "target": trigger["minimum_family_observations"],
+                                "source": "original frozen champion inputs only; separate covariates cannot unlock this holdout"},
         "leagues_with_20_each_group": {"current": leagues_with_both,
                                         "target": trigger["minimum_leagues_with_20_each_group"]},
         "representativeness_pass": {"current": int(representativeness_pass), "target": 1},
@@ -270,6 +349,9 @@ def summarize(db_path, sidecar_path):
         item.get("current", item.get("current_min", 0)) >= item["target"]
         for item in readiness.values()
     )
+    ready = bool(ready and health['integrity_ok'] and health['immutable_triggers']==2
+        and not incomplete_runs and not provider_drift
+        and all(x.get('available_before_decision') for x in prefilter))
     result = {
         "decision": "READY_TO_EVALUATE" if ready else "INSUFFICIENT_DATA",
         "outcomes_opened": False,
@@ -294,6 +376,13 @@ def summarize(db_path, sidecar_path):
             "prefilter_valid_1x2": len(prefilter), "prediction_snapshots": len(predictions),
             "prefilter_champion_predictions": len(prefilter_prediction_rows),
             "family_available_counts": dict(coverage), "auxiliary_market_counts": dict(aux),
+            "original_champion_family_counts":dict(original_coverage),
+            "corrected_frozen_input_family_counts":dict(frozen_input_coverage),
+            "free_shots_recovered_from_frozen_inputs":free_shots_recovered,
+            "separate_covariate_snapshots":covariates_valid,
+            "rejected_covariate_snapshots":covariates_rejected,
+            "covariate_versions":dict(covariate_versions),
+            "separate_covariates_unlock_original_holdout":False,
             "family_status": family_status,
             "by_eligibility": {k: dict(v) for k, v in coverage_by_group.items()},
         },
@@ -314,6 +403,7 @@ def summarize(db_path, sidecar_path):
                 for dimension, values in strata_by_group.items()
             },
             "uses_labels": False,
+            "country_repairs_from_original_league":metadata_repairs,
         },
         "eligibility_dataset": {"groups": dict(groups), "n": len(prefilter),
                                 "labels_opened": False},
@@ -353,6 +443,12 @@ def summarize(db_path, sidecar_path):
                                      "big_chances_available": coverage.get("big_chances", 0),
                                      "status": "INSUFFICIENT_SAMPLE"},
         "holdout_protocol": plan,
+        "data_collection_health": {
+            "status":"COVERAGE_BLOCKED" if family_min < trigger['minimum_family_observations'] else "PASS",
+            "undercovered_frozen_families":[name for name in target_families
+                if frozen_input_coverage.get(name,0)<trigger['minimum_family_observations']],
+            "new_covariates_require_versioned_future_holdout":True,
+        },
         "evaluation_trigger": {"checks": readiness, "ready": ready,
                                "representativeness_checked": representativeness_pass},
     }
@@ -391,6 +487,9 @@ def markdown(data):
         f"Snapshots de previsão: {data['coverage_dashboard']['prediction_snapshots']}.", "",
         f"Famílias disponíveis: `{json.dumps(data['coverage_dashboard']['family_available_counts'], ensure_ascii=False)}`.", "",
         f"Coverage por eligibility: `{json.dumps(data['coverage_dashboard']['by_eligibility'], ensure_ascii=False)}`.", "",
+        f"Cobertura original do campeão: `{json.dumps(data['coverage_dashboard']['original_champion_family_counts'], ensure_ascii=False)}`. "
+        f"Covariáveis de pesquisa capturadas separadamente antes do jogo: {data['coverage_dashboard']['separate_covariate_snapshots']}; "
+        "as previsões e os atributos originais do campeão permanecem congelados.", "",
         "## C — Coverage by league", "",
     ]
     league_rows=data["coverage_by_league"][:20]
